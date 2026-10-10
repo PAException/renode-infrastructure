@@ -25,7 +25,7 @@ namespace Antmicro.Renode.Peripherals.CAN
 {
     public partial class NXP_FlexCAN : BasicDoubleWordPeripheral, IBytePeripheral, ICAN, IKnownSize
     {
-        public NXP_FlexCAN(IMachine machine, uint numberOfMessageBuffers = 64, uint enhancedRxFifoSize = 0, uint baudRate = 1000000) : base(machine)
+        public NXP_FlexCAN(IMachine machine, uint numberOfMessageBuffers = 64, uint enhancedRxFifoSize = 0, uint baudRate = 1000000, uint dataBaudRate = 0) : base(machine)
         {
             if(numberOfMessageBuffers != 32 && numberOfMessageBuffers != 64 && numberOfMessageBuffers != 96)
             {
@@ -43,8 +43,14 @@ namespace Antmicro.Renode.Peripherals.CAN
             this.enhancedRxFifoSize = enhancedRxFifoSize;
             // Default to 1Mbps
             this.baudRate = baudRate;
+            // Bit rate of a CAN FD frame's data phase when it switches bit rate; defaults to the nominal one
+            this.dataBaudRate = dataBaudRate == 0 ? baudRate : dataBaudRate;
 
             IRQ = new GPIO();
+            MessageBuffers0To31IRQ = new GPIO();
+            MessageBuffers32To63IRQ = new GPIO();
+            MessageBuffers64To95IRQ = new GPIO();
+            messageBufferRangeIRQs = new[] { MessageBuffers0To31IRQ, MessageBuffers32To63IRQ, MessageBuffers64To95IRQ };
 
             messageBufferRange = new Range((ulong)Registers.MessageBuffer, MessageBufferRegionsCount * MessageBufferRegionSize);
             messageBuffers = new ArrayMemory(messageBufferRange.Size);
@@ -57,6 +63,10 @@ namespace Antmicro.Renode.Peripherals.CAN
             transmitFrames = new Queue<ulong>();
 
             freeRunningTimer = new LimitTimer(machine.ClockSource, this.baudRate, this, nameof(freeRunningTimer), limit: UInt16.MaxValue, direction: Time.Direction.Ascending, enabled: true);
+
+            receiveBacklog = new Queue<CANMessageFrame>();
+            receiveSpacing = new LimitTimer(machine.ClockSource, NanosecondsPerSecond, this, nameof(receiveSpacing), limit: 1, direction: Time.Direction.Ascending, enabled: false, workMode: WorkMode.OneShot, eventEnabled: true);
+            receiveSpacing.LimitReached += OnReceiveSpacingElapsed;
 
             DefineRegisters();
         }
@@ -83,13 +93,26 @@ namespace Antmicro.Renode.Peripherals.CAN
                 }
             }
 
-            OnFrameReceivedInner(message);
+            // NOTE: Frames from other machines (CAN hub) or injected while the machines are paused arrive
+            // in bursts at synchronization points, all at the same instant. A message buffer that is
+            // still full would be overwritten before the CPU could service its interrupt, which a real
+            // bus never does: there, frames are at least one frame time apart. So a frame that arrives
+            // less than one frame time after the previous one is held back until then. Frames the
+            // software doesn't read in time are still overwritten, as on hardware.
+            if(receiveSpacing.Enabled)
+            {
+                receiveBacklog.Enqueue(message);
+                return;
+            }
+            DeliverReceivedFrame(message);
         }
 
         public override void Reset()
         {
             base.Reset();
             freeRunningTimer.Reset();
+            receiveSpacing.Reset();
+            receiveBacklog.Clear();
 
             // Reset state is "Freeze" which implies disabled timer
             freeRunningTimer.Enabled = false;
@@ -161,7 +184,18 @@ namespace Antmicro.Renode.Peripherals.CAN
             this.WriteByteNotTranslated(offset, value);
         }
 
+        /// <summary>All interrupts ORed, e.g. for the S32K1's single message buffer interrupt line.</summary>
+        [DefaultInterrupt]
         public GPIO IRQ { get; }
+
+        /// <summary>
+        /// Message buffer interrupts per 32 message buffers, for chips with a line per range (S32K3: FlexCANn_1..3).
+        /// </summary>
+        public GPIO MessageBuffers0To31IRQ { get; }
+
+        public GPIO MessageBuffers32To63IRQ { get; }
+
+        public GPIO MessageBuffers64To95IRQ { get; }
 
         public long Size => 0x3200;
 
@@ -211,6 +245,10 @@ namespace Antmicro.Renode.Peripherals.CAN
             transmitInProgress = true;
             var messageBuffer = MessageBufferStructure.FetchMetadata(messageBuffers, offset);
 
+            // FIXME: Size is the message buffer's size in bytes, so transmissions complete ~8 times earlier
+            // than on a real bus (FrameTimeNanoseconds() would be the realistic time). Kept as is for now:
+            // with the realistic time, firmware sending several frames back to back through one transmit
+            // message buffer loses most of them, which has to be checked against the car first.
             var bitTime = 1.0/baudRate;
             var transmitTime = TimeInterval.FromSeconds(bitTime * messageBuffer.Size);
             this.Log(LogLevel.Noisy, "Scheduled MB from: {0} for transmission after: {1}us", offset, transmitTime.TotalMicroseconds);
@@ -292,22 +330,55 @@ namespace Antmicro.Renode.Peripherals.CAN
 
         private bool OnFrameReceivedToMessageBufferInner(CANMessageFrame frame)
         {
-            var matchedItem = MessageBuffersIterator
-                .Select((entry, index) => new { Entry = entry, Index = index })
-                .Where(item => item.Entry.MessageBuffer.ReadyForReception && GetMessageBufferMatcher(item.Index).IsMatching(frame, item.Entry.MessageBuffer))
-                .OrderBy(item => Tuple.Create(item.Entry.MessageBuffer.MessageBufferCode, item.Index))
-                .FirstOrDefault();
+            // NOTE: Decoding every message buffer with Packet.Decode on each received frame costs
+            // milliseconds per frame. Only the 4-bit CODE field is needed to rule out a message buffer,
+            // so it is read directly and only buffers ready for reception get decoded. As on hardware,
+            // only message buffers up to MCR.MAXMB take part in matching.
+            var lastIndex = Math.Min((int)lastMessageBufferIndex.Value, (int)numberOfMessageBuffers - 1);
 
-            if(matchedItem == null)
+            MessageBufferStructure? messageBuffer = null;
+            var messageBufferOffset = 0UL;
+            var messageBufferIndex = -1;
+
+            var index = 0;
+            foreach(var offset in MessageBufferOffsetsIterator)
+            {
+                if(index > lastIndex)
+                {
+                    break;
+                }
+
+                var code = (byte)((messageBuffers.ReadDoubleWord((long)offset) >> MessageBufferCodeOffset) & MessageBufferCodeMask);
+                // NOTE: Same order as before: lowest CODE first, then lowest index
+                if(IsReadyForReception(code) && (messageBuffer == null || code < messageBuffer.Value.MessageBufferCode))
+                {
+                    var candidate = MessageBufferStructure.FetchMetadata(messageBuffers, offset);
+                    if(GetMessageBufferMatcher(index).IsMatching(frame, candidate))
+                    {
+                        messageBuffer = candidate;
+                        messageBufferOffset = offset;
+                        messageBufferIndex = index;
+                    }
+                }
+                ++index;
+            }
+
+            if(messageBuffer == null)
             {
                 this.Log(LogLevel.Debug, "Did not found matching message buffer for rx frame: {0}", frame);
                 return false;
             }
 
-            var messageBuffer = matchedItem.Entry.MessageBuffer;
-            var messageBufferOffset = matchedItem.Entry.Offset;
-            var messageBufferIndex = matchedItem.Index;
+            return FillMatchedMessageBuffer(frame, messageBuffer.Value, messageBufferOffset, messageBufferIndex);
+        }
 
+        private static bool IsReadyForReception(byte code) =>
+            (RxMessageBufferCode)code == RxMessageBufferCode.Empty ||
+            (RxMessageBufferCode)code == RxMessageBufferCode.Full ||
+            (RxMessageBufferCode)code == RxMessageBufferCode.Overrun;
+
+        private bool FillMatchedMessageBuffer(CANMessageFrame frame, MessageBufferStructure messageBuffer, ulong messageBufferOffset, int messageBufferIndex)
+        {
             this.Log(LogLevel.Debug, "Found matching message buffer#{0}: {1}", messageBufferIndex, messageBuffer);
 
             messageBuffer.Timestamp = (ushort)freeRunningTimer.Value;
@@ -317,6 +388,46 @@ namespace Antmicro.Renode.Peripherals.CAN
             UpdateInterrupts();
 
             return true;
+        }
+
+        private void DeliverReceivedFrame(CANMessageFrame frame)
+        {
+            OnFrameReceivedInner(frame);
+            receiveSpacing.Value = 0;
+            receiveSpacing.Limit = FrameTimeNanoseconds(frame);
+            receiveSpacing.Enabled = true;
+        }
+
+        private void OnReceiveSpacingElapsed()
+        {
+            if(receiveBacklog.Count > 0)
+            {
+                DeliverReceivedFrame(receiveBacklog.Dequeue());
+            }
+        }
+
+        private ulong FrameTimeNanoseconds(CANMessageFrame frame)
+        {
+            return FrameTimeNanoseconds(frame.ExtendedFormat, frame.Data?.Length ?? 0, frame.FDFormat, frame.BitRateSwitch);
+        }
+
+        // Rough duration of a frame on the bus, with ~20 % stuff bits. Classic CAN: 47 bits of overhead for a
+        // standard ID (67 for an extended one) plus the data, at the nominal bit rate. CAN FD: ~29 bits
+        // (+18 for an extended ID) at the nominal bit rate around a data phase of control field, data and
+        // CRC (~30 bits + the data), which runs at the data bit rate if the frame switches bit rate.
+        private ulong FrameTimeNanoseconds(bool extendedId, int dataLength, bool fdFormat, bool bitRateSwitch)
+        {
+            double seconds;
+            if(!fdFormat)
+            {
+                seconds = ((extendedId ? 67 : 47) + 8 * dataLength) / (double)baudRate;
+            }
+            else
+            {
+                var dataPhaseBits = 30 + 8 * dataLength;
+                seconds = (extendedId ? 47 : 29) / (double)baudRate + dataPhaseBits / (double)(bitRateSwitch ? dataBaudRate : baudRate);
+            }
+            return (ulong)Math.Max(1.0, seconds * 1.2 * NanosecondsPerSecond);
         }
 
         private void OnFrameReceivedInner(CANMessageFrame frame)
@@ -457,11 +568,12 @@ namespace Antmicro.Renode.Peripherals.CAN
 
         private void RegisterMessageBufferInterruptFlags(DoubleWordRegister flagRegister, DoubleWordRegister maskRegister, int start, int fieldStart = 0, int fieldMax = 32)
         {
-            var flags = (int)Math.Min(fieldMax, numberOfMessageBuffers - fieldStart);
+            // Message buffers start..start+fieldMax-1 in bits fieldStart.., as far as they exist (32 on some instances)
+            var flags = Math.Max(0, Math.Min(fieldMax, (int)numberOfMessageBuffers - start));
             if(fieldMax - flags > 0)
             {
-                flagRegister.WithReservedBits(flags, fieldMax - flags);
-                maskRegister.WithReservedBits(flags, fieldMax - flags);
+                flagRegister.WithReservedBits(fieldStart + flags, fieldMax - flags);
+                maskRegister.WithReservedBits(fieldStart + flags, fieldMax - flags);
             }
 
             flagRegister.WithChangeCallback((_, __) => UpdateInterrupts());
@@ -531,7 +643,16 @@ namespace Antmicro.Renode.Peripherals.CAN
 
         private void UpdateInterrupts()
         {
-            var interrupt = Enumerable.Range(0, (int)numberOfMessageBuffers).Any(i => messageBufferInterrupt[i].Value && messageBufferInterruptEnable[i].Value);
+            var ranges = messageBufferRangeIRQs;
+            var interrupt = false;
+            for(var range = 0; range < ranges.Length; range++)
+            {
+                var first = range * 32;
+                var count = Math.Max(0, Math.Min(32, (int)numberOfMessageBuffers - first));
+                var pending = Enumerable.Range(first, count).Any(i => messageBufferInterrupt[i].Value && messageBufferInterruptEnable[i].Value);
+                ranges[range].Set(pending);
+                interrupt |= pending;
+            }
             interrupt |= selfWakeUpInterrupt.Value;
 
             if(interrupt != IRQ.IsSet)
@@ -1113,14 +1234,19 @@ namespace Antmicro.Renode.Peripherals.CAN
         private readonly uint numberOfMessageBuffers;
         private readonly uint enhancedRxFifoSize;
         private readonly uint baudRate;
+        private readonly uint dataBaudRate;
         private readonly Range messageBufferRange;
 
         private readonly ArrayMemory messageBuffers;
         private readonly Queue<KeyValuePair<ushort, CANMessageFrame>> legacyRxFifo;
         private readonly Queue<ulong> transmitFrames;
         private readonly LimitTimer freeRunningTimer;
+        private readonly LimitTimer receiveSpacing;
+        private readonly GPIO[] messageBufferRangeIRQs;
+        private readonly Queue<CANMessageFrame> receiveBacklog;
 
         private const int NumberOfLegacyMessageBuffers = 38;
+        private const long NanosecondsPerSecond = 1000000000;
         private const int MessageBufferRegionsCount = 3;
         private const int MessageBufferRegionSize = 0x200;
         private const int LegacyRxFifoSize = 6;
@@ -1132,6 +1258,10 @@ namespace Antmicro.Renode.Peripherals.CAN
         private const int LegacyRxFifoInterruptFramesAvailable = 5;
         private const int LegacyRxFifoInterruptWarning = 6;
         private const int LegacyRxFifoInterruptOverflow = 7;
+
+        // CODE field of a message buffer's first double word, see MessageBufferStructure
+        private const int MessageBufferCodeOffset = 24;
+        private const uint MessageBufferCodeMask = 0xF;
 
         enum State
         {

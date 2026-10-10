@@ -395,6 +395,14 @@ namespace Antmicro.Renode.Peripherals.CPU
                     CheckIfOnSynchronizedThread();
                 }
                 this.NoisyLog("IRQ {0}, value {1}", number, value);
+                if(!started)
+                {
+                    // Not running yet, e.g. right after an emulation was loaded, whose interrupt lines are restored but
+                    // whose tlib state doesn't know them: applied once the CPU starts, see OnResume()
+                    irqsBeforeStart = irqsBeforeStart ?? new Dictionary<int, bool>();
+                    irqsBeforeStart[number] = value;
+                    return;
+                }
                 // as we are waiting for an interrupt we should, obviously, not mask it
                 if(started && (lastTlibResult == TlibExecutionResult.WaitingForInterrupt || lastTlibResult == TlibExecutionResult.Lockup
                     || !(DisableInterruptsWhileStepping && IsSingleStepMode)))
@@ -1631,6 +1639,22 @@ namespace Antmicro.Renode.Peripherals.CPU
             return MultiprocessingId;
         }
 
+        protected override void OnResume()
+        {
+            lock(lck)
+            {
+                if(irqsBeforeStart != null)
+                {
+                    foreach(var irq in irqsBeforeStart)
+                    {
+                        TlibSetIrqWrapped(irq.Key, irq.Value);
+                    }
+                    irqsBeforeStart = null;
+                }
+            }
+            base.OnResume();
+        }
+
         private void TlibSetIrqWrapped(int number, bool state)
         {
             var decodedInterrupt = DecodeInterrupt(number);
@@ -2407,6 +2431,9 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         // TODO
         private readonly object lck = new object();
+        // Interrupt line changes while the CPU wasn't started, by line number, see OnGPIO()
+        [Transient]
+        private Dictionary<int, bool> irqsBeforeStart;
         private readonly object executionLock = new object();
         private readonly MinimalRangesCollection mappedMemory = new MinimalRangesCollection();
         private readonly CpuThreadPauseGuard pauseGuard;

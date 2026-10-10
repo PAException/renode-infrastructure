@@ -517,6 +517,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 var intervalToReport = TimeInterval.FromCPUCycles(cycles, PerformanceInMips, out executedResiduum);
                 ElapsedCycles += cycles;
                 TimeHandle.ReportProgress(intervalToReport);
+                (machine as Antmicro.Renode.Core.Machine)?.AdvanceClockWithCpu(this, intervalToReport);
             }
         }
 

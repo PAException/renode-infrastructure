@@ -11,8 +11,11 @@ namespace Antmicro.Renode.Peripherals.Network
 {
     public class S32K3XX_GMAC : SynopsysDWCEthernetQualityOfService
     {
+        // The data bus is 32 bits wide (FEATURE_GMAC_DATA_BUS_WIDTH_BITS in NXP's RTD), which is what the
+        // descriptor skip length (DMA_CHx_CONTROL.DSL) counts in: with 64, the RTD's 32-byte descriptors are
+        // stepped as 48-byte ones and transmission stalls on the second one.
         public S32K3XX_GMAC(IMachine machine, ulong systemClockFrequency, ICPU cpuContext = null)
-            : base(machine, systemClockFrequency, cpuContext, BusWidth.Bits64, rxQueueSize: DMAQueueSize, txQueueSize: DMAQueueSize, dmaChannelCount: 3)
+            : base(machine, systemClockFrequency, cpuContext, BusWidth.Bits32, rxQueueSize: DMAQueueSize, txQueueSize: DMAQueueSize, dmaChannelCount: 3)
         {
             IPVersion = 0x52;
             UserIPVersion = 0x10;

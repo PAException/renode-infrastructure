@@ -674,8 +674,69 @@ namespace Antmicro.Renode.Core
         {
             if(!IsHalted)
             {
-                clockSource.Advance(diff);
+                // Part of this may already have been advanced along with the CPU, see AdvanceClockWithCpu
+                lock(clockAheadLock)
+                {
+                    var alreadyAdvanced = TimeInterval.Min(clockAhead, diff);
+                    clockAhead -= alreadyAdvanced;
+                    diff -= alreadyAdvanced;
+                }
+                if(diff.Ticks > 0)
+                {
+                    clockSource.Advance(diff);
+                }
             }
+        }
+
+        /// <summary>
+        /// Signals every interrupt line that drives a CPU and is set to that CPU again. A loaded emulation restores the
+        /// lines as they were set, but not the CPUs' view of them: a CPU wouldn't take an interrupt that was pending
+        /// when it was saved, nor a new one of the same line, as the line doesn't change to signal it. Call it right
+        /// after loading; the CPUs apply it when they start (TranslationCPU.OnGPIO()).
+        /// </summary>
+        public void ReassertCpuInterrupts()
+        {
+            foreach(var peripheral in GetPeripheralsOfType<IPeripheral>().ToList())
+            {
+                foreach(var gpio in peripheral.GetGPIOs().Select(entry => entry.Item2))
+                {
+                    if(!gpio.IsSet)
+                    {
+                        continue;
+                    }
+                    foreach(var endpoint in gpio.Endpoints)
+                    {
+                        if(endpoint.Receiver is ICPU)
+                        {
+                            endpoint.Receiver.OnGPIO(endpoint.Number, false);
+                            endpoint.Receiver.OnGPIO(endpoint.Number, true);
+                        }
+                    }
+                }
+            }
+        }
+
+        public bool AdvanceClockWithCpuEnabled { get; set; } = true;
+
+        /// <summary>
+        /// With serial execution, the time source reports elapsed time only when it synchronizes, at the end
+        /// of a quantum. Every timer of the machine's peripherals would only fire then. A machine with a
+        /// single running CPU therefore advances its clock right with that CPU's progress, like it happens with
+        /// parallel execution - but driven by the CPU's executed instructions only, so it stays deterministic.
+        /// Other CPUs may exist as long as they are halted (e.g. cores a platform has but the software doesn't
+        /// start); with several running, it is left to the time source.
+        /// </summary>
+        public void AdvanceClockWithCpu(ICPU cpu, TimeInterval progress)
+        {
+            if(!AdvanceClockWithCpuEnabled || IsHalted || progress.Ticks == 0 || !LocalTimeSource.ExecuteInSerial || !IsOnlyRunningCpu(cpu))
+            {
+                return;
+            }
+            lock(clockAheadLock)
+            {
+                clockAhead += progress;
+            }
+            clockSource.Advance(progress);
         }
 
         public void RequestReset()
@@ -1954,6 +2015,26 @@ namespace Antmicro.Renode.Core
         private readonly object recorderPlayerLock = new object();
 
         private readonly BaseClockSource clockSource;
+        private readonly object clockAheadLock = new object();
+        // Time the clock was advanced with the CPU ahead of the time source, see AdvanceClockWithCpu
+        private TimeInterval clockAhead;
+        // CPUs are registered while the machine is built, before it ever runs
+        private bool IsOnlyRunningCpu(ICPU cpu)
+        {
+            foreach(var other in Cpus)
+            {
+                if(other != cpu && !other.IsHalted)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // CPUs are registered while the machine is built, before it ever runs
+        private ICPU[] Cpus => cpus ?? (cpus = SystemBus.GetCPUs().ToArray());
+        [Transient]
+        private ICPU[] cpus;
         private readonly object invalidatedAddressesLock;
         private readonly Dictionary<string, List<long>> invalidatedAddressesByArchitecture;
         private readonly Dictionary<TranslationCPU, List<long>> invalidatedAddressesByCpu;

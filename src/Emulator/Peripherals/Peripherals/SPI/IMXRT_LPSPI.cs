@@ -86,7 +86,9 @@ namespace Antmicro.Renode.Peripherals.SPI
                 .WithFlag(13, out dataMatch, FieldMode.Read | FieldMode.WriteOneToClear, name: "DMF - Data Match Flag")
                 .WithReservedBits(14, 10)
                 .WithTaggedFlag("MBF - Module Busy Flag", 24)
-                .WithReservedBits(25, 7);
+                .WithReservedBits(25, 7)
+                // Clearing TCF/DMF has to release the interrupt they hold
+                .WithWriteCallback((_, __) => UpdateInterrupts());
 
             Registers.TransmitCommand.Define(this)
                 .WithValueField(0, 12, out frameSize, name: "FRAMESZ - Frame Size")
@@ -142,7 +144,8 @@ namespace Antmicro.Renode.Peripherals.SPI
                 .WithReservedBits(21, 11);
 
             Registers.FIFOControl.Define(this)
-                .WithTag("TXWATER - Transmit FIFO Watermark", 0, 2)
+                // Doesn't matter: the transmit FIFO drains immediately, so TDF is always set
+                .WithValueField(0, 2, name: "TXWATER - Transmit FIFO Watermark")
                 .WithReservedBits(2, 14)
                 .WithValueField(16, 2, out rxWatermark, name: "RXWATER - Receive FIFO Watermark")
                 .WithReservedBits(18, 14);
@@ -208,8 +211,10 @@ namespace Antmicro.Renode.Peripherals.SPI
                 .WithWriteCallback((_, __) => UpdateInterrupts());
 
             Registers.InterruptEnable.Define(this)
-                // Transmit Data Flag is always set so the Transmit Interrupt is never triggered.
-                .WithFlag(0, name: "TDIE - Transmit Data Interrupt Enable")
+                // The Transmit Data Flag is always set (the transmit FIFO drains immediately), so the
+                // interrupt is pending for as long as it is enabled - drivers that fill the FIFO from it
+                // (e.g. NXP's S32K1 SDK) disable it once they have nothing more to send.
+                .WithFlag(0, out transmitDataInterruptEnable, name: "TDIE - Transmit Data Interrupt Enable")
                 .WithFlag(1, out receiveDataInterruptEnable, name: "RDIE - Receive Data Interrupt Enable")
                 .WithReservedBits(2, 6)
                 .WithTaggedFlag("WCIE - Word Complete Interrupt Enable", 8)
@@ -396,15 +401,16 @@ namespace Antmicro.Renode.Peripherals.SPI
                 UpdateInterrupts();
             }
 
-            if(sizeLeft == 0 && !currentCommand.ContinuingCommand)
+            if(sizeLeft == 0)
             {
-                if(!continuousTransfer.Value)
+                if(currentCommand.Continuous)
+                {
+                    // PCS stays asserted until a command that doesn't continue this transfer, see EndContinuousTransfer
+                    continuousTransferInProgress = true;
+                }
+                else if(!currentCommand.ContinuingCommand)
                 {
                     device.FinishTransmission();
-                }
-                else
-                {
-                    continuousTransferInProgress = true;
                 }
             }
 
@@ -426,12 +432,30 @@ namespace Antmicro.Renode.Peripherals.SPI
         {
             var flag = false;
 
+            flag |= transmitDataInterruptEnable.Value;
             flag |= receiveDataInterruptEnable.Value && receiveFifo.Count > (int)rxWatermark.Value;
             flag |= transferComplete.Value && transferCompleteInterruptEnable.Value;
-            flag |= dataMatch.Value | dataMatchInterruptEnable.Value;
+            flag |= dataMatch.Value && dataMatchInterruptEnable.Value;
 
             this.Log(LogLevel.Debug, "Setting IRQ flag to {0}", flag);
             IRQ.Set(flag);
+        }
+
+        private void EndContinuousTransfer()
+        {
+            if(!continuousTransferInProgress || sizeLeft != 0)
+            {
+                return;
+            }
+            // A command that doesn't continue the transfer negates PCS. With nothing else to send, the
+            // LPSPI is idle again, which is what TCF signals.
+            continuousTransferInProgress = false;
+            if(TryGetDevice(out var device))
+            {
+                device.FinishTransmission();
+            }
+            transferComplete.Value = true;
+            UpdateInterrupts();
         }
 
         private void TryTransmitFifoDequeue(out uint? poppedData)
@@ -444,6 +468,10 @@ namespace Antmicro.Renode.Peripherals.SPI
                 if(tcEntry is TCFifoCmd cmd)
                 {
                     currentCommand = cmd;
+                    if(!cmd.ContinuingCommand)
+                    {
+                        EndContinuousTransfer();
+                    }
                 }
                 else if(tcEntry is TCFifoData data)
                 {
@@ -508,16 +536,6 @@ namespace Antmicro.Renode.Peripherals.SPI
                     break;
                 }
 
-                if(!currentCommand.ContinuingCommand && continuousTransferInProgress && (sizeLeft == 0))
-                {
-                    continuousTransferInProgress = false;
-                    // Finish last transmission in case with are not in continuing mode.
-                    if(TryGetDevice(out var device))
-                    {
-                        device.FinishTransmission();
-                    }
-                }
-
                 // When Transmit Data Mask is set, transmit data is masked (no data is loaded from transmit FIFO and output pin is tristated).
                 // In master mode, the Transmit Data Mask bit will initiate a new transfer which cannot be aborted by another command word;
                 if(currentCommand.TxMask)
@@ -569,6 +587,7 @@ namespace Antmicro.Renode.Peripherals.SPI
         private IFlagRegisterField continuousTransfer;
         private IFlagRegisterField circularFifoEnabled;
 
+        private IFlagRegisterField transmitDataInterruptEnable;
         private IFlagRegisterField receiveDataInterruptEnable;
         private IFlagRegisterField transferCompleteInterruptEnable;
         private IFlagRegisterField dataMatchInterruptEnable;
